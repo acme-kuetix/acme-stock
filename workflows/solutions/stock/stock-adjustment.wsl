@@ -1,0 +1,252 @@
+// POST /stock/adjust — adjust stock quantity (increase or decrease).
+// JSON body: {productId, locationId, delta, reason}.
+// delta can be positive (increase) or negative (decrease). Updates the
+// stock_levels document and creates an audit trail entry in stock_adjustments.
+// Provided by acme-stock package.
+
+module stock_adjustment
+
+import core/orchestration
+import core/utils
+import math/ops
+import persistence/store
+import sequence/sequence
+import services/common
+
+workflow stock_adjustment {
+  start: FindExistingStock
+
+  state FindExistingStock {
+    action persistence/store/store.FindByField(
+      collection: "stock_levels",
+      field: "productId",
+      value: $json.productId
+    ) as FindResult
+    on success -> CheckFound
+    on error -> FindFailed
+  }
+
+  state CheckFound {
+    action services/common/response.Response(
+      value: { found: $FindResult.response.found },
+      statusCode: 200
+    ) as FoundCheck
+    on success when $FoundCheck.response.found == true -> LoadStockLevel
+    on success -> CreateZeroStockLevel
+    on error -> CheckFoundFailed
+  }
+
+  state LoadStockLevel {
+    action persistence/store/store.Get(
+      collection: "stock_levels",
+      id: $FindResult.response.doc.id
+    ) as StockResult
+    on success -> ComputeNewQty
+    on error -> LoadStockLevelFailed
+  }
+
+  state CreateZeroStockLevel {
+    action sequence/sequence.NextByCode(code: "stock-level", scope: "") as SeqResult
+    on success -> CreateStockLevel
+    on error -> CreateZeroStockLevelFailed
+  }
+
+  state CreateStockLevel {
+    action persistence/store/store.Create(
+      collection: "stock_levels",
+      id: $SeqResult.response.formatted,
+      doc: {
+        id: $SeqResult.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        qtyOnHand: 0,
+        reservedQty: 0,
+        createdAt: "now"
+      }
+    ) as CreateResult
+    on success -> ComputeNewQtyZero
+    on error -> CreateStockLevelFailed
+  }
+
+  state ComputeNewQty {
+    action math/ops/ops.Add(
+      a: $StockResult.response.doc.qtyOnHand,
+      b: $json.delta
+    ) as NewQtyResult
+    on success -> CreateAdjustment
+    on error -> ComputeNewQtyFailed
+  }
+
+  state ComputeNewQtyZero {
+    action math/ops/ops.Add(
+      a: 0,
+      b: $json.delta
+    ) as NewQtyResult
+    on success -> CreateAdjustment
+    on error -> ComputeNewQtyZeroFailed
+  }
+
+  state CreateAdjustment {
+    action sequence/sequence.NextByCode(code: "stock-adjustment", scope: "") as AdjSeq
+    on success -> CreateAdjustmentDoc
+    on error -> CreateAdjustmentFailed
+  }
+
+  state CreateAdjustmentDoc {
+    action persistence/store/store.Create(
+      collection: "stock_adjustments",
+      id: $AdjSeq.response.formatted,
+      doc: {
+        id: $AdjSeq.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        delta: $json.delta,
+        reason: $json.reason,
+        type: "manual",
+        createdAt: "now"
+      }
+    ) as AdjResult
+    on success -> StashAdjDoc
+    on error -> CreateAdjustmentDocFailed
+  }
+
+  state StashAdjDoc {
+    action core/utils/utils.SetValue(
+      key: "adj.doc",
+      value: $AdjResult.response.doc
+    ) as StashedAdj
+    on success -> UpdateStockLevel
+    on error -> UpdateStockLevel
+  }
+
+  state UpdateStockLevel {
+    action persistence/store/store.Update(
+      collection: "stock_levels",
+      id: $StockResult.response.doc.id,
+      doc: {
+        id: $StockResult.response.doc.id,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        qtyOnHand: $NewQtyResult.response.result,
+        reservedQty: $StockResult.response.doc.reservedQty,
+        createdAt: $StockResult.response.doc.createdAt,
+        updatedAt: "now"
+      }
+    ) as UpdateResult
+    on success -> SetAuditData
+    on error -> UpdateStockLevelFailed
+  }
+
+  state SetAuditData {
+    action core/utils/utils.SetValue(
+      key: "audit.eventData",
+      value: {
+        actor: $json.actor??"",
+        workflow: "stock-adjustment",
+        state: "Adjusted",
+        transition: "StockAdjustment",
+        entityType: "stock_adjustment",
+        entityId: $AdjSeq.response.formatted,
+        before: $StockResult.response.doc,
+        after: $StashedAdj.response.value,
+        success: true
+      }
+    ) as AuditData
+    on success -> RecordAudit
+    on error -> OK
+  }
+
+  state RecordAudit {
+    action core/orchestration/orchestration.RunWorkflow(name: "solutions/audit/record") as AuditResult
+    on success -> OK
+    on error -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $StashedAdj.response.value,
+      statusCode: 201
+    ) as FinalResult
+    end ok
+  }
+
+  state FindFailed {
+    action services/common/response.Response(
+      value: { message: $FindResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckFoundFailed {
+    action services/common/response.Response(
+      value: { message: "failed to check stock level", code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state LoadStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $StockResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateZeroStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $SeqResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $CreateResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state ComputeNewQtyFailed {
+    action services/common/response.Response(
+      value: { message: $NewQtyResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state ComputeNewQtyZeroFailed {
+    action services/common/response.Response(
+      value: { message: $NewQtyResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateAdjustmentFailed {
+    action services/common/response.Response(
+      value: { message: $AdjSeq.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateAdjustmentDocFailed {
+    action services/common/response.Response(
+      value: { message: $AdjResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state UpdateStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $UpdateResult.response.message, code: "adjust_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

@@ -1,0 +1,36 @@
+// GET /stock/moves/{moveId} — fetch a single stock move with all its lines.
+// Provided by acme-stock package.
+
+module stock_move_get
+
+import persistence/store
+import services/common
+
+workflow stock_move_get {
+  start: Get
+
+  state Get {
+    action persistence/store/store.Get(
+      collection: "stock_moves",
+      id: $url.moveId
+    ) as Result
+    on success -> OK
+    on error -> Failed
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $Result.response.doc,
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state Failed {
+    action services/common/response.Response(
+      value: { message: $Result.response.message??"get failed", code: $Result.response.code??"get_failed" },
+      statusCode: $Result.statusCode??404
+    ) as ErrorResult
+    end fail
+  }
+}

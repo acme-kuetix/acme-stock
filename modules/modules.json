@@ -1,0 +1,12 @@
+{
+  "stock/stock": {
+    "info": {
+      "go_module": "github.com/acme-kuetix/acme-stock",
+      "namespace": "stock",
+      "class": "stock",
+      "label": "Stock Module",
+      "description": "Handles stock operations for stock service"
+    },
+    "methods": null
+  }
+}

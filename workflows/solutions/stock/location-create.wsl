@@ -1,0 +1,73 @@
+// POST /stock/locations — create a stock location (warehouse/internal/supplier/customer/production/transit).
+// JSON body: {code, name, type, parentId?, active?, address?}
+// Location ID is auto-assigned via sequence/sequence.NextByCode
+// (code: "stock-location", padding 0, prefix "" → bare integer string "1", "2", ...).
+// Provided by acme-stock package.
+//
+// Per-state failure handlers: each errorable state routes to its own
+// <StateName>Failed terminal state with a LITERAL statusCode (chosen per
+// failure type) and $Alias.response.message for the message. Avoids the
+// WSL ?? operator which doesn't work for $Alias.field??literal when the
+// alias exists but the field is missing (tokenSegmentClass includes ?),
+// and avoids $? which is overwritten by worker.SetError to 500 on every
+// error path.
+
+module stock_location_create
+
+import persistence/store
+import sequence/sequence
+import services/common
+
+workflow stock_location_create {
+  start: GetId
+
+  state GetId {
+    action sequence/sequence.NextByCode(code: "stock-location", scope: "") as IdResult
+    on success -> Create
+    on error -> GetIdFailed
+  }
+
+  state Create {
+    action persistence/store/store.Create(
+      collection: "stock_locations",
+      id: $IdResult.response.formatted,
+      doc: {
+        id: $IdResult.response.formatted,
+        code: $json.code,
+        name: $json.name,
+        type: $json.type,
+        parentId: $json.parentId??"",
+        active: $json.active??true,
+        address: $json.address??"",
+        createdAt: "",
+        updatedAt: ""
+      }
+    ) as Result
+    on success -> OK
+    on error -> CreateFailed
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $Result.response.doc,
+      statusCode: 201
+    ) as FinalResult
+    end ok
+  }
+
+  state GetIdFailed {
+    action services/common/response.Response(
+      value: { message: $IdResult.response.message, code: "create_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateFailed {
+    action services/common/response.Response(
+      value: { message: $Result.response.message, code: $Result.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

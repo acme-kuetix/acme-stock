@@ -1,0 +1,27 @@
+// GET /stock/locations — list all locations, optionally filtered by ?type=warehouse|internal|...
+// Provided by acme-stock package.
+
+module stock_location_list
+
+import persistence/store
+import services/common
+
+workflow stock_location_list {
+  start: List
+
+  state List {
+    action persistence/store/store.List(
+      collection: "stock_locations",
+      filter: {}
+    ) as Result
+    on success -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: { count: $Result.response.count, items: $Result.response.docs },
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+}

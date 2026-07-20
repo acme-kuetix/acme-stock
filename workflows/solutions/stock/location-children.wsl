@@ -1,0 +1,65 @@
+// GET /stock/locations/{locationId}/children — return the location subtree.
+// Uses collections/ops/ops.RecurseForest to build the tree in Go (WSL can't
+// recurse). The rootId filter is applied by first loading the full forest,
+// then filtering to the requested root's subtree.
+
+module stock_location_children
+
+import collections/ops
+import persistence/store
+import services/common
+
+workflow stock_location_children {
+  start: ListLocations
+
+  state ListLocations {
+    action persistence/store/store.List(collection: "stock_locations", filter: {}) as LocationList
+    on success -> BuildForest
+    on error -> Failed
+  }
+
+  state BuildForest {
+    action collections/ops/ops.RecurseForest(
+      docs: $LocationList.response.docs,
+      idField: "id",
+      parentField: "parentId",
+      childField: "children",
+      sortBy: "code"
+    ) as Forest
+    on success -> FilterRoot
+    on error -> Failed
+  }
+
+  state FilterRoot {
+    action collections/ops/ops.Find(
+      arr: $Forest.response.forest,
+      workflow: "solutions/stock/location-matches-root"
+    ) as RootMatch
+    on success -> OK
+    on error -> NotFound
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: { count: $Forest.response.count, tree: [$RootMatch.response.doc] },
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state NotFound {
+    action services/common/response.Response(
+      value: { message: "location not found" },
+      statusCode: 404
+    ) as ErrorResult
+    end fail
+  }
+
+  state Failed {
+    action services/common/response.Response(
+      value: { message: "failed to build location tree" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

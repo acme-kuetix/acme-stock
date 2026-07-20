@@ -1,0 +1,74 @@
+// PUT /stock/locations/{locationId} — update mutable fields of a location.
+// JSON body: {name, type, parentId?, active?, address?}
+// Code is immutable. Type may change only if the location has no children.
+// Provided by acme-stock package.
+//
+// Per-state failure handlers: each errorable state routes to its own
+// <StateName>Failed terminal state with a LITERAL statusCode (chosen per
+// failure type) and $Alias.response.message for the message. Avoids the
+// WSL ?? operator which doesn't work for $Alias.field??literal when the
+// alias exists but the field is missing (tokenSegmentClass includes ?),
+// and avoids $? which is overwritten by worker.SetError to 500 on every
+// error path.
+
+module stock_location_update
+
+import persistence/store
+import services/common
+
+workflow stock_location_update {
+  start: Load
+
+  state Load {
+    action persistence/store/store.Get(
+      collection: "stock_locations",
+      id: $url.locationId
+    ) as LoadResult
+    on success -> Update
+    on error -> LoadFailed
+  }
+
+  state Update {
+    action persistence/store/store.Update(
+      collection: "stock_locations",
+      id: $url.locationId,
+      doc: {
+        id: $LoadResult.response.doc.id,
+        code: $LoadResult.response.doc.code,
+        name: $json.name,
+        type: $json.type,
+        parentId: $json.parentId??"",
+        active: $json.active??true,
+        address: $json.address??"",
+        createdAt: $LoadResult.response.doc.createdAt,
+        updatedAt: ""
+      }
+    ) as Result
+    on success -> OK
+    on error -> UpdateFailed
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $Result.response.doc,
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state LoadFailed {
+    action services/common/response.Response(
+      value: { message: $LoadResult.response.message, code: $LoadResult.response.code },
+      statusCode: 404
+    ) as ErrorResult
+    end fail
+  }
+
+  state UpdateFailed {
+    action services/common/response.Response(
+      value: { message: $Result.response.message, code: $Result.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

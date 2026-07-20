@@ -1,0 +1,117 @@
+// POST /stock/moves/{moveId}/pick — transition a confirmed move to picked.
+// Picked = goods reserved against on-hand, ready for packing.
+// Requires state == "confirmed".
+// Provided by acme-stock package.
+//
+// Per-state failure handlers: each errorable state routes to its own
+// <StateName>Failed terminal state with a LITERAL statusCode.
+
+module stock_move_pick
+
+import core/orchestration
+import core/utils
+import persistence/store
+import services/common
+
+workflow stock_move_pick {
+  start: Load
+
+  state Load {
+    action persistence/store/store.Get(
+      collection: "stock_moves",
+      id: $url.moveId
+    ) as LoadResult
+    on success -> CheckState
+    on error -> LoadFailed
+  }
+
+  state CheckState {
+    action persistence/store/store.AssertFieldEquals(
+      collection: "stock_moves",
+      id: $url.moveId,
+      field: "state",
+      value: "confirmed"
+    ) as StateCheck
+    on success -> Update
+    on error -> CheckStateFailed
+  }
+
+  state Update {
+    action persistence/store/store.Update(
+      collection: "stock_moves",
+      id: $url.moveId,
+      doc: {
+        id: $LoadResult.response.doc.id,
+        reference: $LoadResult.response.doc.reference,
+        sourceId: $LoadResult.response.doc.sourceId,
+        destinationId: $LoadResult.response.doc.destinationId,
+        state: "picked",
+        scheduledAt: $LoadResult.response.doc.scheduledAt,
+        origin: $LoadResult.response.doc.origin,
+        note: $LoadResult.response.doc.note,
+        lines: $LoadResult.response.doc.lines,
+        createdAt: $LoadResult.response.doc.createdAt,
+        updatedAt: "now"
+      }
+    ) as UpdateResult
+    on success -> SetAuditData
+    on error -> UpdateFailed
+  }
+
+  state SetAuditData {
+    action core/utils/utils.SetValue(
+      key: "audit.eventData",
+      value: {
+        actor: $json.actor??"",
+        workflow: "stock-move-pick",
+        state: "Picked",
+        transition: "PickStockMove",
+        entityType: "stock-move",
+        entityId: $url.moveId,
+        before: $LoadResult.response.doc,
+        after: $UpdateResult.response.doc,
+        success: true
+      }
+    ) as AuditData
+    on success -> RecordAudit
+    on error -> OK
+  }
+
+  state RecordAudit {
+    action core/orchestration/orchestration.RunWorkflow(name: "solutions/audit/record") as AuditResult
+    on success -> OK
+    on error -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $UpdateResult.response.doc,
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state LoadFailed {
+    action services/common/response.Response(
+      value: { message: $LoadResult.response.message, code: $LoadResult.response.code },
+      statusCode: 404
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckStateFailed {
+    action services/common/response.Response(
+      value: { message: $StateCheck.response.message, code: $StateCheck.response.code },
+      statusCode: 409
+    ) as ErrorResult
+    end fail
+  }
+
+  state UpdateFailed {
+    action services/common/response.Response(
+      value: { message: $UpdateResult.response.message, code: $UpdateResult.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

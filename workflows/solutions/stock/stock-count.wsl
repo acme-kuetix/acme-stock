@@ -1,0 +1,302 @@
+// POST /stock/count — record a cycle count and create adjustment if delta.
+// JSON body: {productId, locationId, countedQty, reason?}.
+// Loads current stock for product+location, computes delta (counted - system),
+// if delta != 0 creates a stock_adjustment doc. Records the count in
+// stock_counts collection regardless.
+// Provided by acme-stock package.
+
+module stock_count
+
+import core/orchestration
+import core/utils
+import math/ops
+import persistence/store
+import sequence/sequence
+import services/common
+
+workflow stock_count {
+  start: FindExistingStock
+
+  state FindExistingStock {
+    action persistence/store/store.FindByField(
+      collection: "stock_levels",
+      field: "productId",
+      value: $json.productId
+    ) as FindResult
+    on success -> CheckFound
+    on error -> FindFailed
+  }
+
+  state CheckFound {
+    action services/common/response.Response(
+      value: { found: $FindResult.response.found },
+      statusCode: 200
+    ) as FoundCheck
+    on success when $FoundCheck.response.found == true -> LoadStockLevel
+    on success -> CreateZeroStockLevel
+    on error -> CheckFoundFailed
+  }
+
+  state LoadStockLevel {
+    action persistence/store/store.Get(
+      collection: "stock_levels",
+      id: $FindResult.response.doc.id
+    ) as StockResult
+    on success -> ComputeDelta
+    on error -> LoadStockLevelFailed
+  }
+
+  state CreateZeroStockLevel {
+    action sequence/sequence.NextByCode(code: "stock-level", scope: "") as SeqResult
+    on success -> CreateStockLevel
+    on error -> CreateZeroStockLevelFailed
+  }
+
+  state CreateStockLevel {
+    action persistence/store/store.Create(
+      collection: "stock_levels",
+      id: $SeqResult.response.formatted,
+      doc: {
+        id: $SeqResult.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        qtyOnHand: 0,
+        reservedQty: 0,
+        createdAt: "now"
+      }
+    ) as CreateResult
+    on success -> ComputeDeltaZero
+    on error -> CreateStockLevelFailed
+  }
+
+  state ComputeDelta {
+    action math/ops/ops.Sub(
+      a: $json.countedQty,
+      b: $StockResult.response.doc.qtyOnHand
+    ) as DeltaResult
+    on success -> RecordCount
+    on error -> ComputeDeltaFailed
+  }
+
+  state ComputeDeltaZero {
+    action math/ops/ops.Sub(
+      a: $json.countedQty,
+      b: 0
+    ) as DeltaResult
+    on success -> RecordCount
+    on error -> ComputeDeltaZeroFailed
+  }
+
+  state RecordCount {
+    action sequence/sequence.NextByCode(code: "stock-count", scope: "") as CountSeq
+    on success -> CreateCountDoc
+    on error -> RecordCountFailed
+  }
+
+  state CreateCountDoc {
+    action persistence/store/store.Create(
+      collection: "stock_counts",
+      id: $CountSeq.response.formatted,
+      doc: {
+        id: $CountSeq.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        countedQty: $json.countedQty,
+        systemQty: $StockResult.response.doc.qtyOnHand,
+        delta: $DeltaResult.response.result,
+        reason: $json.reason??"cycle count",
+        countedAt: "now"
+      }
+    ) as CountResult
+    on success -> CheckDelta
+    on error -> CreateCountDocFailed
+  }
+
+  state CheckDelta {
+    action services/common/response.Response(
+      value: { delta: $DeltaResult.response.result },
+      statusCode: 200
+    ) as DeltaCheck
+    on success -> CreateAdjustment
+    on error -> CheckDeltaFailed
+  }
+
+  state CreateAdjustment {
+    action sequence/sequence.NextByCode(code: "stock-adjustment", scope: "") as AdjSeq
+    on success -> CreateAdjustmentDoc
+    on error -> CreateAdjustmentFailed
+  }
+
+  state CreateAdjustmentDoc {
+    action persistence/store/store.Create(
+      collection: "stock_adjustments",
+      id: $AdjSeq.response.formatted,
+      doc: {
+        id: $AdjSeq.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        delta: $DeltaResult.response.result,
+        reason: $json.reason??"cycle count adjustment",
+        type: "count",
+        createdAt: "now"
+      }
+    ) as AdjResult
+    on success -> UpdateStockLevel
+    on error -> CreateAdjustmentDocFailed
+  }
+
+  state UpdateStockLevel {
+    action persistence/store/store.Update(
+      collection: "stock_levels",
+      id: $StockResult.response.doc.id,
+      doc: {
+        id: $StockResult.response.doc.id,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        qtyOnHand: $json.countedQty,
+        reservedQty: $StockResult.response.doc.reservedQty,
+        createdAt: $StockResult.response.doc.createdAt,
+        updatedAt: "now"
+      }
+    ) as UpdateResult
+    on success -> SetAuditData
+    on error -> UpdateStockLevelFailed
+  }
+
+  state SetAuditData {
+    action core/utils/utils.SetValue(
+      key: "audit.eventData",
+      value: {
+        actor: $json.actor??"",
+        workflow: "stock-count",
+        state: "Counted",
+        transition: "StockCount",
+        entityType: "stock_count",
+        entityId: $CountSeq.response.formatted,
+        before: {},
+        after: $CountResult.response.doc,
+        success: true
+      }
+    ) as AuditData
+    on success -> RecordAudit
+    on error -> OK
+  }
+
+  state RecordAudit {
+    action core/orchestration/orchestration.RunWorkflow(name: "solutions/audit/record") as AuditResult
+    on success -> OK
+    on error -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $CountResult.response.doc,
+      statusCode: 201
+    ) as FinalResult
+    end ok
+  }
+
+  state FindFailed {
+    action services/common/response.Response(
+      value: { message: $FindResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckFoundFailed {
+    action services/common/response.Response(
+      value: { message: "failed to check stock level", code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state LoadStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $StockResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateZeroStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $SeqResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $CreateResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state ComputeDeltaFailed {
+    action services/common/response.Response(
+      value: { message: $DeltaResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state ComputeDeltaZeroFailed {
+    action services/common/response.Response(
+      value: { message: $DeltaResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state RecordCountFailed {
+    action services/common/response.Response(
+      value: { message: $CountSeq.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateCountDocFailed {
+    action services/common/response.Response(
+      value: { message: $CountResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckDeltaFailed {
+    action services/common/response.Response(
+      value: { message: "delta check failed", code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateAdjustmentFailed {
+    action services/common/response.Response(
+      value: { message: $AdjSeq.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateAdjustmentDocFailed {
+    action services/common/response.Response(
+      value: { message: $AdjResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state UpdateStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $UpdateResult.response.message, code: "count_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

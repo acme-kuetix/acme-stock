@@ -1,0 +1,125 @@
+// POST /stock/moves/{moveId}/lines — add a product line to a draft or confirmed move.
+// JSON body: {productId, qty, uomId, note?}
+// Fails if the move is done or cancelled.
+// Provided by acme-stock package.
+//
+// Per-state failure handlers: each errorable state routes to its own
+// <StateName>Failed terminal state with a LITERAL statusCode (chosen per
+// failure type) and $Alias.response.message for the message. Avoids the
+// WSL ?? operator which doesn't work for $Alias.field??literal when the
+// alias exists but the field is missing (tokenSegmentClass includes ?),
+// and avoids $? which is overwritten by worker.SetError to 500 on every
+// error path.
+
+module stock_move_line_add
+
+import collections/ops
+import persistence/store
+import sequence/sequence
+import services/common
+
+workflow stock_move_line_add {
+  start: LoadMove
+
+  state LoadMove {
+    action persistence/store/store.Get(
+      collection: "stock_moves",
+      id: $url.moveId
+    ) as LoadResult
+    on success -> GetLineId
+    on error -> LoadMoveFailed
+  }
+
+  state GetLineId {
+    action sequence/sequence.NextByCode(code: "stock-move-line", scope: "") as LineIdResult
+    on success -> AppendLine
+    on error -> GetLineIdFailed
+  }
+
+  state AppendLine {
+    action collections/ops/ops.Append(
+      arr: $LoadResult.response.doc.lines,
+      element: {
+        id: $LineIdResult.response.formatted,
+        moveId: $url.moveId,
+        productId: $json.productId,
+        quantity: $json.qty,
+        uomId: $json.uomId,
+        unitCost: $json.unitCost??0,
+        note: $json.note??"",
+        createdAt: ""
+      }
+    ) as AppendResult
+    on success -> StoreUpdate
+    on error -> AppendLineFailed
+  }
+
+  state StoreUpdate {
+    action persistence/store/store.Update(
+      collection: "stock_moves",
+      id: $url.moveId,
+      doc: {
+        id: $LoadResult.response.doc.id,
+        reference: $LoadResult.response.doc.reference,
+        sourceId: $LoadResult.response.doc.sourceId,
+        destinationId: $LoadResult.response.doc.destinationId,
+        scheduledAt: $LoadResult.response.doc.scheduledAt,
+        origin: $LoadResult.response.doc.origin,
+        note: $LoadResult.response.doc.note,
+        state: $LoadResult.response.doc.state,
+        lines: $AppendResult.response.arr,
+        createdAt: $LoadResult.response.doc.createdAt,
+        updatedAt: "now"
+      }
+    ) as UpdateResult
+    on success -> OK
+    on error -> StoreUpdateFailed
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: {
+        id: $LineIdResult.response.formatted,
+        moveId: $url.moveId,
+        productId: $json.productId,
+        quantity: $json.qty,
+        uomId: $json.uomId,
+        note: $json.note??""
+      },
+      statusCode: 201
+    ) as FinalResult
+    end ok
+  }
+
+  state LoadMoveFailed {
+    action services/common/response.Response(
+      value: { message: $LoadResult.response.message, code: $LoadResult.response.code },
+      statusCode: 404
+    ) as ErrorResult
+    end fail
+  }
+
+  state GetLineIdFailed {
+    action services/common/response.Response(
+      value: { message: $LineIdResult.response.message, code: "line_add_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state AppendLineFailed {
+    action services/common/response.Response(
+      value: { message: $AppendResult.response.message, code: "line_add_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state StoreUpdateFailed {
+    action services/common/response.Response(
+      value: { message: $UpdateResult.response.message, code: $UpdateResult.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

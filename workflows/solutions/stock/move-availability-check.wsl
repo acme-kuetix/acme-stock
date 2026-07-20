@@ -1,0 +1,148 @@
+// GET /stock/moves/availability?productId=&locationId=&qty=
+// Checks whether the requested qty is available at the source location.
+// Returns {available: bool, onHand, reserved, availableQty, requestedQty}.
+// Provided by acme-stock package.
+
+module stock_move_availability_check
+
+import math/ops
+import persistence/store
+import services/common
+
+workflow stock_move_availability_check {
+  start: FindStockLevel
+
+  state FindStockLevel {
+    action persistence/store/store.FindByField(
+      collection: "stock_levels",
+      field: "productId",
+      value: $qs.productId
+    ) as FindResult
+    on success -> CheckFound
+    on error -> FindFailed
+  }
+
+  state CheckFound {
+    action services/common/response.Response(
+      value: { found: $FindResult.response.found },
+      statusCode: 200
+    ) as FoundCheck
+    on success when $FoundCheck.response.found == true -> LoadStockLevel
+    on success -> NoStockLevel
+    on error -> CheckFoundFailed
+  }
+
+  state LoadStockLevel {
+    action persistence/store/store.Get(
+      collection: "stock_levels",
+      id: $FindResult.response.doc.id
+    ) as StockResult
+    on success -> ComputeAvailable
+    on error -> LoadStockLevelFailed
+  }
+
+  state ComputeAvailable {
+    action math/ops/ops.Sub(
+      a: $StockResult.response.doc.qtyOnHand,
+      b: $StockResult.response.doc.reservedQty
+    ) as AvailResult
+    on success -> CheckAvailable
+    on error -> ComputeAvailableFailed
+  }
+
+  state CheckAvailable {
+    action services/common/response.Response(
+      value: { available: true, availableQty: $AvailResult.response.result },
+      statusCode: 200
+    ) as AvailCheck
+    on success when $AvailCheck.response.availableQty >= $qs.qty -> AvailableOK
+    on success -> NotAvailable
+    on error -> CheckAvailableFailed
+  }
+
+  state AvailableOK {
+    action services/common/response.Response(
+      value: {
+        available: true,
+        onHand: $StockResult.response.doc.qtyOnHand,
+        reserved: $StockResult.response.doc.reservedQty,
+        availableQty: $AvailResult.response.result,
+        requestedQty: $qs.qty
+      },
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state NotAvailable {
+    action services/common/response.Response(
+      value: {
+        available: false,
+        onHand: $StockResult.response.doc.qtyOnHand,
+        reserved: $StockResult.response.doc.reservedQty,
+        availableQty: $AvailResult.response.result,
+        requestedQty: $qs.qty,
+        message: "insufficient stock available",
+        code: "insufficient_stock"
+      },
+      statusCode: 409
+    ) as FinalResult
+    end ok
+  }
+
+  state NoStockLevel {
+    action services/common/response.Response(
+      value: {
+        available: false,
+        onHand: 0,
+        reserved: 0,
+        availableQty: 0,
+        requestedQty: $qs.qty,
+        message: "no stock level found for product",
+        code: "no_stock_level"
+      },
+      statusCode: 404
+    ) as FinalResult
+    end ok
+  }
+
+  state FindFailed {
+    action services/common/response.Response(
+      value: { message: $FindResult.response.message, code: "availability_check_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckFoundFailed {
+    action services/common/response.Response(
+      value: { message: "failed to check stock level", code: "availability_check_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state LoadStockLevelFailed {
+    action services/common/response.Response(
+      value: { message: $StockResult.response.message, code: "availability_check_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state ComputeAvailableFailed {
+    action services/common/response.Response(
+      value: { message: $AvailResult.response.message, code: "availability_check_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckAvailableFailed {
+    action services/common/response.Response(
+      value: { message: "availability check failed", code: "availability_check_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

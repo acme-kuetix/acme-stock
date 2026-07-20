@@ -1,0 +1,99 @@
+// POST /stock/reserve — reserve stock for a product at a location.
+// JSON body: {productId, locationId, qty, orderId?, reservationId?}.
+// Creates a reservation document in the "stock_reservations" collection.
+// Does NOT modify qtyOnHand — reservation reduces available qty, not on-hand.
+// Provided by acme-stock package.
+
+module stock_reserve
+
+import core/orchestration
+import core/utils
+import persistence/store
+import sequence/sequence
+import services/common
+
+workflow stock_reserve {
+  start: GetReservationId
+
+  state GetReservationId {
+    action sequence/sequence.NextByCode(code: "stock-reservation", scope: "") as SeqResult
+    on success -> CreateReservation
+    on error -> GetReservationIdFailed
+  }
+
+  state CreateReservation {
+    action persistence/store/store.Create(
+      collection: "stock_reservations",
+      id: $SeqResult.response.formatted,
+      doc: {
+        id: $SeqResult.response.formatted,
+        productId: $json.productId,
+        locationId: $json.locationId,
+        qty: $json.qty,
+        orderId: $json.orderId??"",
+        state: "active",
+        createdAt: "now"
+      }
+    ) as CreateResult
+    on success -> StashReservation
+    on error -> CreateReservationFailed
+  }
+
+  state StashReservation {
+    action core/utils/utils.SetValue(
+      key: "reservation.doc",
+      value: $CreateResult.response.doc
+    ) as Stashed
+    on success -> SetAuditData
+    on error -> SetAuditData
+  }
+
+  state SetAuditData {
+    action core/utils/utils.SetValue(
+      key: "audit.eventData",
+      value: {
+        actor: $json.actor??"",
+        workflow: "stock-reserve",
+        state: "Reserved",
+        transition: "ReserveStock",
+        entityType: "stock_reservation",
+        entityId: $SeqResult.response.formatted,
+        before: {},
+        after: $Stashed.response.value,
+        success: true
+      }
+    ) as AuditData
+    on success -> RecordAudit
+    on error -> OK
+  }
+
+  state RecordAudit {
+    action core/orchestration/orchestration.RunWorkflow(name: "solutions/audit/record") as AuditResult
+    on success -> OK
+    on error -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $Stashed.response.value,
+      statusCode: 201
+    ) as FinalResult
+    end ok
+  }
+
+  state GetReservationIdFailed {
+    action services/common/response.Response(
+      value: { message: $SeqResult.response.message, code: "reserve_failed" },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+
+  state CreateReservationFailed {
+    action services/common/response.Response(
+      value: { message: $CreateResult.response.message, code: $CreateResult.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}

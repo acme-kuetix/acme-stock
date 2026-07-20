@@ -1,0 +1,12 @@
+{
+  "name": "acme-stock",
+  "version": "0.1.0",
+  "description": "Acme package with reusable workflows and transitions for stock: locations, stock moves, inventory tracking",
+  "author": "acme",
+  "workflows": [],
+  "features": [],
+  "solutions": [],
+  "dependencies": {
+    "github.com/kuetix/std-core": "v1.0.0"
+  }
+}

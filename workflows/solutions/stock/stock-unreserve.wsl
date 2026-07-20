@@ -1,0 +1,111 @@
+// POST /stock/unreserve — release a stock reservation.
+// JSON body: {reservationId}.
+// Marks the reservation as "released" (does not delete — keeps audit trail).
+// Provided by acme-stock package.
+
+module stock_unreserve
+
+import core/orchestration
+import core/utils
+import persistence/store
+import services/common
+
+workflow stock_unreserve {
+  start: Load
+
+  state Load {
+    action persistence/store/store.Get(
+      collection: "stock_reservations",
+      id: $json.reservationId
+    ) as LoadResult
+    on success -> CheckState
+    on error -> LoadFailed
+  }
+
+  state CheckState {
+    action persistence/store/store.AssertFieldEquals(
+      collection: "stock_reservations",
+      id: $json.reservationId,
+      field: "state",
+      value: "active"
+    ) as StateCheck
+    on success -> UpdateReservation
+    on error -> CheckStateFailed
+  }
+
+  state UpdateReservation {
+    action persistence/store/store.Update(
+      collection: "stock_reservations",
+      id: $json.reservationId,
+      doc: {
+        id: $LoadResult.response.doc.id,
+        productId: $LoadResult.response.doc.productId,
+        locationId: $LoadResult.response.doc.locationId,
+        qty: $LoadResult.response.doc.qty,
+        orderId: $LoadResult.response.doc.orderId,
+        state: "released",
+        releasedAt: "now",
+        createdAt: $LoadResult.response.doc.createdAt
+      }
+    ) as UpdateResult
+    on success -> SetAuditData
+    on error -> UpdateReservationFailed
+  }
+
+  state SetAuditData {
+    action core/utils/utils.SetValue(
+      key: "audit.eventData",
+      value: {
+        actor: $json.actor??"",
+        workflow: "stock-unreserve",
+        state: "Released",
+        transition: "UnreserveStock",
+        entityType: "stock_reservation",
+        entityId: $json.reservationId,
+        before: $LoadResult.response.doc,
+        after: $UpdateResult.response.doc,
+        success: true
+      }
+    ) as AuditData
+    on success -> RecordAudit
+    on error -> OK
+  }
+
+  state RecordAudit {
+    action core/orchestration/orchestration.RunWorkflow(name: "solutions/audit/record") as AuditResult
+    on success -> OK
+    on error -> OK
+  }
+
+  state OK {
+    action services/common/response.Response(
+      value: $UpdateResult.response.doc,
+      statusCode: 200
+    ) as FinalResult
+    end ok
+  }
+
+  state LoadFailed {
+    action services/common/response.Response(
+      value: { message: $LoadResult.response.message, code: $LoadResult.response.code },
+      statusCode: 404
+    ) as ErrorResult
+    end fail
+  }
+
+  state CheckStateFailed {
+    action services/common/response.Response(
+      value: { message: $StateCheck.response.message, code: $StateCheck.response.code },
+      statusCode: 409
+    ) as ErrorResult
+    end fail
+  }
+
+  state UpdateReservationFailed {
+    action services/common/response.Response(
+      value: { message: $UpdateResult.response.message, code: $UpdateResult.response.code },
+      statusCode: 500
+    ) as ErrorResult
+    end fail
+  }
+}
