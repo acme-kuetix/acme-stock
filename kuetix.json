@@ -1,6 +1,6 @@
 {
   "name": "acme-stock",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Acme package with reusable workflows and transitions for stock: locations, stock moves, inventory tracking",
   "author": "acme",
   "workflows": [],
